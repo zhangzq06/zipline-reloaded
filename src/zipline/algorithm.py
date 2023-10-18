@@ -504,6 +504,8 @@ class TradingAlgorithm:
             else:
                 execution_opens = market_opens
                 execution_closes = market_closes
+
+            before_trading_start_minutes = execution_opens - pd.Timedelta(minutes=46)
         else:
             # in daily mode, we want to have one bar per session, timestamped
             # as the last minute of the session.
@@ -516,13 +518,10 @@ class TradingAlgorithm:
                 execution_closes = market_closes
                 execution_opens = market_closes
 
-        # FIXME generalize these values
-        before_trading_start_minutes = days_at_time(
-            self.sim_params.sessions,
-            time(8, 45),
-            "US/Eastern",
-            day_offset=0,
-        )
+            # follow quantrocket/zipline,
+            # making the pipeline execute after market close to eliminate lags
+            # in daily mode.
+            execution_opens = before_trading_start_minutes = execution_closes
 
         return MinuteSimulationClock(
             self.sim_params.sessions,
@@ -2236,8 +2235,29 @@ class TradingAlgorithm:
 
     def _pipeline_output(self, pipeline, chunks, name):
         """Internal implementation of `pipeline_output`."""
-        # TODO FIXME TZ MESS
-        today = self.get_datetime().normalize().tz_localize(None)
+
+        # normalize algo datetime to session label; this requires converting
+        # to calendar tz, normalizing to midnight, then localizing back to UTC.
+        # Otherwise, the normalized date could be wrong with a country like Japan
+        # because the UTC time falls before midnight on the previous date.
+        today = self.get_datetime().tz_convert(
+            self.trading_calendar.tz).normalize().tz_localize(
+                None)
+
+        # copied from quantrocket/zipline
+        # In daily mode, we want the pipeline output that is timestamped to the *next*
+        # session, not the current session. Explanation: In daily mode, the day's OHLC
+        # bar is fed to the algorithm AFTER the close (timestamped 16:00 for US equities).
+        # Any orders placed will be filled at tomorrow's close. In contrast, Pipeline is
+        # designed to be fed to the algorithm BEFORE the open (in before_trading_start);
+        # Pipeline data is lagged so that today's data shows up in tomorrow's pipeline.
+        # This means that, to align bar data and pipeline data, we need to load *tomorrow's*
+        # pipeline data with today's bar data. Otherwise, pipeline data will be lagged by
+        # two days instead of one, because today's pipeline output contains yesterday's values,
+        # and orders placed based on those values won't be executed until tomorrow's close.
+        if self.sim_params.data_frequency == "daily":
+            today = self.trading_calendar.next_session(today)
+
         try:
             data = self._pipeline_cache.get(name, today)
         except KeyError:
@@ -2281,7 +2301,14 @@ class TradingAlgorithm:
 
         # ...continuing until either the day before the simulation end, or
         # until chunksize days of data have been loaded.
-        sim_end_session = self.sim_params.end_session
+
+        # follow quantrocket/zipline:
+        # Note that we take
+        # the max of sim_params.end_session and start_session because
+        # start_session could be after the end_session in daily mode, since
+        # we need to load tomorrow's pipeline data. See comment in
+        # _pipeline_output for more explanation.
+        sim_end_session = max(start_session, self.sim_params.end_session)
 
         end_loc = min(start_date_loc + chunksize, sessions.get_loc(sim_end_session))
 
